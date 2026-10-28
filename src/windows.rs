@@ -10,7 +10,8 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use nt_time::FileTime;
 use serde::de::DeserializeOwned;
@@ -21,7 +22,8 @@ use tauri::{
 };
 use windows::ApplicationModel::Package;
 use windows::Data::Xml::Dom::XmlDocument;
-use windows::Foundation::{DateTime, TypedEventHandler};
+use windows::Foundation::Collections::ValueSet;
+use windows::Foundation::{DateTime, IStringable, TypedEventHandler};
 #[cfg(feature = "push-notifications")]
 use windows::Networking::PushNotifications::{
     PushNotificationChannel, PushNotificationChannelManager,
@@ -30,14 +32,23 @@ use windows::UI::Notifications::{
     NotificationSetting, ScheduledToastNotification, ToastActivatedEventArgs, ToastNotification,
     ToastNotificationManager, ToastNotifier,
 };
-use windows::Win32::Foundation::{CLASS_E_NOAGGREGATION, E_INVALIDARG, S_FALSE, S_OK};
+use windows::Win32::Foundation::{
+    CLASS_E_NOAGGREGATION, E_FAIL, E_INVALIDARG, ERROR_NOT_FOUND, S_FALSE, S_OK,
+};
 use windows::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoInitializeEx, CoRegisterClassObject,
-    IClassFactory, IClassFactory_Impl, REGCLS_MULTIPLEUSE,
+    CoUninitialize, IClassFactory, IClassFactory_Impl, REGCLS_MULTIPLEUSE,
+};
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+    RegCreateKeyExW, RegSetValueExW,
 };
 use windows::Win32::UI::Notifications::{
     INotificationActivationCallback, INotificationActivationCallback_Impl,
     NOTIFICATION_USER_INPUT_DATA,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetMessageW, MSG, TranslateMessage,
 };
 use windows::core::{BOOL, GUID, HSTRING, Interface, PCWSTR, Ref, implement};
 
@@ -56,6 +67,27 @@ use crate::models::{ActionType, ActiveNotification, PendingNotification, Schedul
 /// family-name hash is install-time only.
 fn is_packaged() -> bool {
     Package::Current().is_ok()
+}
+
+fn notification_permission(
+    setting: windows::core::Result<NotificationSetting>,
+    packaged: bool,
+) -> crate::Result<PermissionState> {
+    let setting = match setting {
+        // Issue #812: an unpackaged AUMID may have no settings until its first toast.
+        Err(error) if !packaged && error.code() == ERROR_NOT_FOUND.to_hresult() => {
+            return Ok(PermissionState::Granted);
+        }
+        result => result?,
+    };
+    match setting {
+        NotificationSetting::Enabled => Ok(PermissionState::Granted),
+        NotificationSetting::DisabledForApplication
+        | NotificationSetting::DisabledForUser
+        | NotificationSetting::DisabledByGroupPolicy
+        | NotificationSetting::DisabledByManifest => Ok(PermissionState::Denied),
+        _ => Ok(PermissionState::Prompt),
+    }
 }
 
 /// Resolve a user-supplied image string into a URI scheme Windows toast
@@ -216,6 +248,23 @@ struct DecodedActivation {
     action: serde_json::Value,
 }
 
+/// Vendored patch: id of the `<input>` box that submits through `action_id`.
+fn input_element_id(action_id: &str) -> String {
+    format!("input-{action_id}")
+}
+
+/// Vendored patch: the `arguments=` an `<action>` carries.
+///
+/// JSON rather than the bare action id so `extra` (session id, title, tag)
+/// survives a cold COM activation, which only ever sees this string.
+fn action_arguments(action_id: &str, extra: &HashMap<String, serde_json::Value>) -> String {
+    serde_json::json!({
+        "actionId": action_id,
+        "data": extra,
+    })
+    .to_string()
+}
+
 fn decode_activation(invoked_args: &str, inputs: &HashMap<String, String>) -> DecodedActivation {
     let input_value = inputs
         .values()
@@ -227,17 +276,49 @@ fn decode_activation(invoked_args: &str, inputs: &HashMap<String, String>) -> De
         .ok()
         .filter(serde_json::Value::is_object);
 
+    // Vendored patch: button activations encode `{"actionId": …, "data": …}` in
+    // the action's `arguments=` so the session identity survives a cold
+    // activation — the COM callback never receives the toast's `launch=`
+    // string. Checked before the tuple match below because such a payload is
+    // also a JSON object and would otherwise be misread as a tap.
+    if let Some(action_id) = parsed
+        .as_ref()
+        .and_then(|payload| payload.get("actionId"))
+        .and_then(serde_json::Value::as_str)
+    {
+        let extra = parsed
+            .as_ref()
+            .and_then(|payload| payload.get("data"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let action = serde_json::json!({
+            "actionId": action_id,
+            "inputValue": input_value,
+            "notification": serde_json::Value::Null,
+            "extra": extra,
+        });
+        return DecodedActivation {
+            click: None,
+            action,
+        };
+    }
+
     // Two independent axes: whether `invoked_args` decoded as the `launch=`
     // JSON object we wrote, and whether it's empty at all. Matched as a tuple
     // so the three outcomes stay side by side.
     match (parsed, invoked_args.is_empty()) {
         (Some(launch), _) => {
+            let extra = launch
+                .get("data")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             // `json!` borrows its value expression (`to_value(&expr)`), so
             // `launch` is still ours to move into `click` afterwards.
             let action = serde_json::json!({
                 "actionId": "tap",
                 "inputValue": input_value,
                 "notification": launch,
+                "extra": extra,
             });
             DecodedActivation {
                 click: Some(launch),
@@ -251,18 +332,20 @@ fn decode_activation(invoked_args: &str, inputs: &HashMap<String, String>) -> De
                 "actionId": "tap",
                 "inputValue": input_value,
                 "notification": serde_json::Value::Null,
+                "extra": {},
             });
             DecodedActivation {
                 click: Some(serde_json::json!({ "id": serde_json::Value::Null, "data": {} })),
                 action,
             }
         }
-        // Button activation — `invoked_args` is the action's `arguments=`.
+        // Button activation carrying legacy plain-string `arguments=`.
         (None, false) => {
             let action = serde_json::json!({
                 "actionId": invoked_args,
                 "inputValue": input_value,
                 "notification": serde_json::Value::Null,
+                "extra": serde_json::Value::Null,
             });
             DecodedActivation {
                 click: None,
@@ -270,6 +353,93 @@ fn decode_activation(invoked_args: &str, inputs: &HashMap<String, String>) -> De
             }
         }
     }
+}
+
+/// Vendored patch: identity of one activation — the arguments plus every
+/// user-input pair, sorted so map iteration order cannot produce two different
+/// signatures for the same activation.
+fn activation_signature(invoked_args: &str, inputs: &HashMap<String, String>) -> String {
+    let mut entries: Vec<(&str, &str)> = inputs
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    entries.sort_unstable();
+
+    let mut signature = String::from(invoked_args);
+    for (key, value) in entries {
+        signature.push('\u{1}');
+        signature.push_str(key);
+        signature.push('=');
+        signature.push_str(value);
+    }
+    signature
+}
+
+/// Vendored patch: activations already delivered, for
+/// [`claim_activation`].
+static DELIVERED: OnceLock<Mutex<Option<(String, Instant)>>> = OnceLock::new();
+
+/// Window inside which a repeated signature counts as the same activation.
+const DEDUP_WINDOW: Duration = Duration::from_millis(1500);
+
+/// Vendored patch: `true` when this activation has not already been delivered.
+///
+/// One toast click reaches Windows through two independent routes — the
+/// in-process `Activated` handler and the out-of-proc COM activator — and
+/// either can run first. Collapsing identical signatures within
+/// [`DEDUP_WINDOW`] makes the JS layer see exactly one event per click.
+///
+/// A poisoned lock or clock anomaly fails open (report as new): a duplicate
+/// event is preferable to a silently swallowed click.
+fn claim_activation(signature: &str) -> bool {
+    let Ok(mut guard) = DELIVERED.get_or_init(|| Mutex::new(None)).lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    if let Some((previous, at)) = guard.as_ref()
+        && previous == signature
+        && now.duration_since(*at) < DEDUP_WINDOW
+    {
+        return false;
+    }
+    *guard = Some((signature.to_string(), now));
+    true
+}
+
+/// Vendored patch: collect the toast text-box contents.
+///
+/// Windows hands them over as a `ValueSet` keyed by the `<input id=…>` the
+/// toast XML declared. Every failure degrades to "no text" rather than losing
+/// the activation — an empty reply still reaches the JS layer as an event.
+fn read_user_input(user_input: Option<&ValueSet>) -> HashMap<String, String> {
+    let mut inputs = HashMap::new();
+    let Some(set) = user_input else {
+        return inputs;
+    };
+    let Ok(iterator) = set.First() else {
+        return inputs;
+    };
+
+    while iterator.HasCurrent().unwrap_or(false) {
+        if let Ok(pair) = iterator.Current() {
+            let key = pair.Key().map(|key| key.to_string()).unwrap_or_default();
+            if !key.is_empty() {
+                let value = pair
+                    .Value()
+                    .ok()
+                    .and_then(|value| value.cast::<IStringable>().ok())
+                    .and_then(|value| value.ToString().ok())
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                inputs.insert(key, value);
+            }
+        }
+        if !iterator.MoveNext().unwrap_or(false) {
+            break;
+        }
+    }
+
+    inputs
 }
 
 impl INotificationActivationCallback_Impl for ToastActivator_Impl {
@@ -294,6 +464,17 @@ impl INotificationActivationCallback_Impl for ToastActivator_Impl {
         }
 
         let decoded = decode_activation(&invoked, &inputs);
+
+        // Vendored patch: the same physical click also reaches the in-process
+        // `Activated` handler, so collapse the pair into one event.
+        if !claim_activation(&activation_signature(&invoked, &inputs)) {
+            log::debug!(
+                "Toast activation already delivered; skipping COM callback (args={invoked:?})"
+            );
+            return Ok(());
+        }
+
+        log::debug!("Toast COM activation (args={invoked:?}, inputs={})", inputs.len());
         let _ = crate::listeners::trigger("actionPerformed", decoded.action.to_string());
 
         if let Some(click_payload) = decoded.click {
@@ -393,7 +574,7 @@ impl WindowsPlugin {
         {
             let channel =
                 PushNotificationChannelManager::CreatePushNotificationChannelForApplicationAsync()?
-                    .join()?;
+                    .get()?;
             let uri = channel.Uri()?.to_string_lossy();
             *self
                 .push_channel
@@ -461,21 +642,41 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
         push_channel: RwLock::new(None),
     });
 
-    if packaged && let Some(clsid_str) = windows_config.toast_activator_clsid {
-        match register_toast_activator(&plugin, &clsid_str) {
-            Ok(cookie) => {
-                if let Ok(mut slot) = plugin.com_cookie.write() {
-                    *slot = Some(cookie);
+    // Vendored patch: the COM activator used to be registered only for packaged
+    // builds, which meant unpackaged DSH never received click or button events
+    // at all. Registering it always is half the fix; the other half is
+    // `register_unpackaged_app_id` below, which gives Windows an AUMID whose
+    // `CustomActivator` points at this CLSID.
+    if let Some(clsid_str) = windows_config.toast_activator_clsid.as_deref() {
+        if !packaged {
+            let display_name = app
+                .config()
+                .product_name
+                .clone()
+                .unwrap_or_else(|| plugin.app_id.clone());
+            let icon_path = windows_config.icon_path.as_ref().and_then(|path| {
+                match app.path().resolve(path, BaseDirectory::Resource) {
+                    Ok(resolved) if resolved.is_file() => Some(resolved),
+                    result => {
+                        log::warn!("Cannot resolve notification icon {path:?}: {result:?}");
+                        None
+                    }
                 }
-                log::info!("Toast activator registered (clsid={clsid_str}, cookie={cookie})");
-            }
-            Err(e) => {
+            });
+            if let Err(e) = register_unpackaged_app_id(
+                &display_name,
+                &plugin.app_id,
+                clsid_str,
+                icon_path.as_deref(),
+            ) {
                 log::error!(
-                    "Failed to register toast activator (clsid={clsid_str}): {e}; \
-                     Action Center clicks will fall back to shortcut launch without payload"
+                    "Failed to register AUMID {} for toast activation: {e}; \
+                     Action Center clicks will fall back to shortcut launch without payload",
+                    plugin.app_id
                 );
             }
         }
+        spawn_toast_activator(&plugin, clsid_str);
     }
 
     Ok(Notifications {
@@ -484,34 +685,230 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     })
 }
 
-/// Initialize COM for the current thread (apartment-threaded) and register a
-/// `ToastActivatorFactory` for the given CLSID. Returns the
-/// `CoRegisterClassObject` cookie on success.
-///
-/// `CoInitializeEx` is idempotent for the same apartment model: `S_OK` on
-/// first call, `S_FALSE` on subsequent calls. `RPC_E_CHANGED_MODE` means
-/// another component already initialized this thread as MTA — surfaced as an
-/// error so the caller logs and skips registration.
-fn register_toast_activator(
-    plugin: &Arc<WindowsPlugin>,
-    clsid_str: &str,
-) -> windows::core::Result<u32> {
-    let clsid = parse_clsid(clsid_str)?;
-    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    if hr != S_OK && hr != S_FALSE {
-        return Err(hr.into());
+/// Vendored patch: write a `REG_SZ` value, creating the key when absent.
+fn write_registry_string(key: HKEY, name: Option<&str>, value: &str) -> windows::core::Result<()> {
+    let mut buffer: Vec<u16> = value.encode_utf16().collect();
+    buffer.push(0);
+    // `RegSetValueExW` takes a byte slice and passes its length as `cbdata`, so
+    // the UTF-16 code units have to be reinterpreted rather than copied.
+    let bytes = unsafe { buffer.align_to::<u8>().1 };
+
+    let name = name.map(HSTRING::from);
+    // The two branches instantiate `P1` differently (`&HSTRING` vs `PCWSTR`) —
+    // both satisfy `Param<PCWSTR>`, but through different impls, so they cannot
+    // share one call expression.
+    let status = unsafe {
+        match name.as_ref() {
+            Some(name) => RegSetValueExW(key, name, None, REG_SZ, Some(bytes)),
+            None => RegSetValueExW(key, PCWSTR::null(), None, REG_SZ, Some(bytes)),
+        }
+    };
+    if status.0 != 0 {
+        Err(status.into())
+    } else {
+        Ok(())
     }
+}
+
+/// Vendored patch: strip the `\\?\` verbatim prefix so `IconUri` is a plain
+/// `C:\…` path.
+///
+/// Tauri resolves `BaseDirectory::Resource` through
+/// `tauri_utils::platform::current_exe`, which canonicalizes the executable path,
+/// and Windows canonicalization returns the verbatim form. The toast platform
+/// silently ignores an `IconUri` in that form — the notification renders with no
+/// app logo — while the identical path without the prefix works, spaces included.
+fn plain_icon_path(path: &std::path::Path) -> std::borrow::Cow<'_, str> {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        std::borrow::Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Owned(rest.to_owned())
+    } else {
+        text
+    }
+}
+
+/// Vendored patch: register the AUMID an unpackaged build needs for toast
+/// activation.
+///
+/// A packaged app inherits a working AUMID from its manifest. An unpackaged one
+/// has none, and without it Windows has no idea which COM class to activate when
+/// the user clicks a toast — the click silently degrades into a plain shortcut
+/// launch that carries no payload. These keys give it that mapping:
+/// `Software\Classes\AppUserModelId\<app_id>` carries the display name and the
+/// `CustomActivator` CLSID, and `Software\Classes\CLSID\{clsid}\LocalServer32`
+/// points at this executable so Windows can relaunch it for a cold activation.
+///
+/// Mirrors what the wry/tao notification guides and the Windows SDK describe for
+/// unpackaged toast registration. Best-effort: failures are logged and the
+/// in-process `Activated` path still delivers clicks while the app is running.
+fn register_unpackaged_app_id(
+    display_name: &str,
+    app_id: &str,
+    clsid_str: &str,
+    icon_path: Option<&std::path::Path>,
+) -> windows::core::Result<()> {
+    let exe = std::env::current_exe().map_err(|e| {
+        windows::core::Error::new(E_FAIL, format!("cannot resolve current executable: {e}"))
+    })?;
+    let exe = exe.to_string_lossy().into_owned();
+
+    // HKCU\Software\Classes\AppUserModelId\<app_id>
+    let aumid_path = HSTRING::from(format!("Software\\Classes\\AppUserModelId\\{app_id}"));
+    let mut aumid_key = HKEY::default();
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            &aumid_path,
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &raw mut aumid_key,
+            None,
+        )
+    };
+    if status.0 != 0 {
+        return Err(status.into());
+    }
+    let result = write_registry_string(aumid_key, Some("DisplayName"), display_name)
+        .and_then(|()| match icon_path {
+            Some(path) => write_registry_string(aumid_key, Some("IconUri"), &plain_icon_path(path)),
+            None => Ok(()),
+        })
+        .and_then(|()| {
+            write_registry_string(
+                aumid_key,
+                Some("CustomActivator"),
+                &format!("{{{clsid_str}}}"),
+            )
+        });
+    unsafe { let _ = RegCloseKey(aumid_key); };
+    result?;
+
+    // HKCU\Software\Classes\CLSID\{clsid}
+    let clsid_path = HSTRING::from(format!("Software\\Classes\\CLSID\\{{{clsid_str}}}"));
+    let mut clsid_key = HKEY::default();
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            &clsid_path,
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &raw mut clsid_key,
+            None,
+        )
+    };
+    if status.0 != 0 {
+        return Err(status.into());
+    }
+    let result = write_registry_string(clsid_key, None, display_name);
+    unsafe { let _ = RegCloseKey(clsid_key); };
+    result?;
+
+    // HKCU\Software\Classes\CLSID\{clsid}\LocalServer32 = <exe>
+    let server_path = HSTRING::from(format!(
+        "Software\\Classes\\CLSID\\{{{clsid_str}}}\\LocalServer32"
+    ));
+    let mut server_key = HKEY::default();
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            &server_path,
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &raw mut server_key,
+            None,
+        )
+    };
+    if status.0 != 0 {
+        return Err(status.into());
+    }
+    let result = write_registry_string(server_key, None, &exe);
+    unsafe { let _ = RegCloseKey(server_key); };
+    result?;
+
+    log::info!("Registered unpackaged AUMID {app_id} (clsid={clsid_str}, exe={exe})");
+    Ok(())
+}
+
+/// Vendored patch: run `register_toast_activator` on a dedicated
+/// single-threaded-apartment thread that pumps messages for the life of the
+/// process.
+///
+/// `CoRegisterClassObject` binds the class to the apartment of the calling
+/// thread, and an STA only serves incoming activation calls while it pumps its
+/// message queue. Tauri's main thread is already MTA (`CoInitializeEx` there
+/// returns `RPC_E_CHANGED_MODE`, which is why the old code silently failed to
+/// register), so registration gets its own thread that blocks in `GetMessageW`.
+fn spawn_toast_activator(plugin: &Arc<WindowsPlugin>, clsid_str: &str) {
+    let clsid = match parse_clsid(clsid_str) {
+        Ok(clsid) => clsid,
+        Err(e) => {
+            log::error!("Invalid toastActivatorClsid {clsid_str}: {e}");
+            return;
+        }
+    };
     let factory = ToastActivatorFactory {
         plugin: Arc::downgrade(plugin),
     };
-    let factory_interface: IClassFactory = factory.into();
-    unsafe {
-        CoRegisterClassObject(
-            &raw const clsid,
-            &factory_interface,
-            CLSCTX_LOCAL_SERVER,
-            REGCLS_MULTIPLEUSE,
-        )
+    let plugin = Arc::clone(plugin);
+    let clsid_str = clsid_str.to_string();
+
+    let spawned = std::thread::Builder::new()
+        .name("dsh-toast-activator".to_string())
+        .spawn(move || {
+            let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            if hr != S_OK && hr != S_FALSE {
+                log::error!("Failed to initialize toast activator apartment: {hr:?}");
+                return;
+            }
+            let factory_interface: IClassFactory = factory.into();
+            let cookie =
+                unsafe { CoRegisterClassObject(&raw const clsid, &factory_interface, CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE) };
+            match cookie {
+                Ok(cookie) => {
+                    if let Ok(mut slot) = plugin.com_cookie.write() {
+                        *slot = Some(cookie);
+                    }
+                    log::info!("Toast activator registered (clsid={clsid_str}, cookie={cookie})");
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to register toast activator (clsid={clsid_str}): {e}; \
+                         Action Center clicks will fall back to shortcut launch without payload"
+                    );
+                    return;
+                }
+            }
+
+            // Keep the apartment alive and dispatch activation calls until the
+            // process exits. `GetMessageW` returning 0 (WM_QUIT) or -1 (error)
+            // both end the loop.
+            let mut message = MSG::default();
+            loop {
+                let result = unsafe { GetMessageW(&raw mut message, None, 0, 0) };
+                if result.0 == 0 || result.0 == -1 {
+                    break;
+                }
+                unsafe {
+                    let _ = TranslateMessage(&raw const message);
+                    DispatchMessageW(&raw const message);
+                }
+            }
+            unsafe { CoUninitialize() };
+        });
+
+    if let Err(e) = spawned {
+        log::error!("Failed to spawn toast activator thread: {e}");
     }
 }
 
@@ -611,11 +1008,46 @@ impl<R: Runtime> crate::NotificationsBuilder<R> {
             && let Some(action_type) = action_types.get(action_type_id)
         {
             let actions = doc.CreateElement(&HSTRING::from("actions"))?;
+
+            // Vendored patch: text boxes are declared before the buttons that
+            // submit them, since `<action hint-inputId=…>` can only reference an
+            // id that already exists in the document.
+            for action in action_type.actions() {
+                if !action.input() {
+                    continue;
+                }
+                let input = doc.CreateElement(&HSTRING::from("input"))?;
+                input.SetAttribute(
+                    &HSTRING::from("id"),
+                    &HSTRING::from(input_element_id(action.id()).as_str()),
+                )?;
+                input.SetAttribute(&HSTRING::from("type"), &HSTRING::from("text"))?;
+                if let Some(placeholder) = action.input_placeholder() {
+                    input.SetAttribute(
+                        &HSTRING::from("placeHolderContent"),
+                        &HSTRING::from(placeholder),
+                    )?;
+                }
+                actions.AppendChild(&input)?;
+            }
+
             for action in action_type.actions() {
                 let action_el = doc.CreateElement(&HSTRING::from("action"))?;
-                action_el
-                    .SetAttribute(&HSTRING::from("content"), &HSTRING::from(action.title()))?;
-                action_el.SetAttribute(&HSTRING::from("arguments"), &HSTRING::from(action.id()))?;
+                // Vendored patch: an input action's caption is the submit
+                // button label, which Windows takes from the same `content=`
+                // attribute as any other button.
+                let content = action.input_button_title().unwrap_or(action.title());
+                action_el.SetAttribute(&HSTRING::from("content"), &HSTRING::from(content))?;
+                action_el.SetAttribute(
+                    &HSTRING::from("arguments"),
+                    &HSTRING::from(action_arguments(action.id(), &self.data.extra).as_str()),
+                )?;
+                if action.input() {
+                    action_el.SetAttribute(
+                        &HSTRING::from("hint-inputId"),
+                        &HSTRING::from(input_element_id(action.id()).as_str()),
+                    )?;
+                }
                 let activation_type = if action.foreground() {
                     "foreground"
                 } else {
@@ -674,7 +1106,13 @@ impl<R: Runtime> crate::NotificationsBuilder<R> {
                 toast.SetGroup(g)?;
             }
 
-            if self.plugin.is_click_listener_active()? {
+            // Vendored patch: `is_click_listener_active` alone was the gate, so a
+            // subscriber that only listened for `actionPerformed` (the reply
+            // button on a question toast, which carries the typed text) never got
+            // an in-process handler attached at all. Either listener now counts.
+            if self.plugin.is_click_listener_active()?
+                || crate::listeners::has_listeners("actionPerformed")
+            {
                 let notification = ActiveNotification {
                     id: self.data.id,
                     tag: Some(self.data.id.to_string()),
@@ -701,25 +1139,65 @@ impl<R: Runtime> crate::NotificationsBuilder<R> {
                                 .map(|s| s.to_string_lossy())
                                 .unwrap_or_default();
 
-                            // Foreground tap: empty `Arguments` (legacy
-                            // toasts without `launch=`) or the JSON object
-                            // we wrote into `launch=`. Anything else is a
-                            // button activation whose `arguments=` we
-                            // surface as the action id.
-                            let is_tap = arguments.is_empty()
-                                || serde_json::from_str::<serde_json::Value>(&arguments)
-                                    .is_ok_and(|v| v.is_object());
+                            // Vendored patch: text typed into any `<input>` the
+                            // toast declared. Windows delivers it only through
+                            // this event args interface, so without reading it
+                            // here a reply could never reach the JS layer.
+                            let inputs =
+                                read_user_input(activated.UserInput().ok().as_ref());
+                            let input_value = inputs
+                                .values()
+                                .next()
+                                .cloned()
+                                .map_or(serde_json::Value::Null, serde_json::Value::String);
 
-                            let action_id = if is_tap {
-                                "tap".to_string()
-                            } else {
-                                arguments
+                            // Vendored patch: one click reaches us twice — here
+                            // and through the out-of-proc COM activator (see
+                            // `claim_activation`). Both carry the same arguments
+                            // and inputs, so the first one through wins.
+                            if !claim_activation(&activation_signature(&arguments, &inputs)) {
+                                log::debug!(
+                                    "Toast activation already delivered; skipping in-process handler (args={arguments:?})"
+                                );
+                                return Ok(());
+                            }
+
+                            let parsed: Option<serde_json::Value> =
+                                serde_json::from_str::<serde_json::Value>(&arguments)
+                                    .ok()
+                                    .filter(serde_json::Value::is_object);
+
+                            // Foreground tap: empty `Arguments` (legacy toasts
+                            // without `launch=`) or the JSON object we wrote into
+                            // `launch=`. A JSON object carrying `actionId` came
+                            // from an `<action arguments=…>` button instead — the
+                            // `launch=` object never has that key.
+                            let button = parsed
+                                .as_ref()
+                                .and_then(|payload| payload.get("actionId"))
+                                .and_then(serde_json::Value::as_str);
+                            let is_tap = button.is_none()
+                                && (arguments.is_empty() || parsed.is_some());
+
+                            let action_id = match button {
+                                Some(action_id) => action_id.to_string(),
+                                None => "tap".to_string(),
                             };
+
+                            // Vendored patch: surface `extra` alongside the
+                            // notification so the JS layer can recover the
+                            // session identity from a button activation too.
+                            let extra = parsed
+                                .as_ref()
+                                .and_then(|payload| payload.get("data"))
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
 
                             let payload = serde_json::json!({
                                 "actionId": action_id,
-                                "inputValue": null,
+                                "inputValue": input_value,
                                 "notification": notification,
+                                "extra": extra,
                             });
                             if let Err(e) =
                                 crate::listeners::trigger("actionPerformed", payload.to_string())
@@ -860,14 +1338,7 @@ impl<R: Runtime> Notifications<R> {
 
     #[allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn permission_state(&self) -> crate::Result<PermissionState> {
-        match self.plugin.notifier.Setting()? {
-            NotificationSetting::Enabled => Ok(PermissionState::Granted),
-            NotificationSetting::DisabledForApplication
-            | NotificationSetting::DisabledForUser
-            | NotificationSetting::DisabledByGroupPolicy
-            | NotificationSetting::DisabledByManifest => Ok(PermissionState::Denied),
-            _ => Ok(PermissionState::Prompt),
-        }
+        notification_permission(self.plugin.notifier.Setting(), self.plugin.packaged)
     }
 
     pub fn register_action_types(&self, types: Vec<ActionType>) -> crate::Result<()> {
@@ -1086,6 +1557,83 @@ mod tests {
     const POWERSHELL_APP_ID: &str =
         "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
 
+    #[test]
+    fn notification_permission_allows_missing_unpackaged_profile() {
+        let error = windows::core::Error::from(ERROR_NOT_FOUND.to_hresult());
+        assert_eq!(
+            notification_permission(Err(error), false).unwrap(),
+            PermissionState::Granted
+        );
+    }
+
+    #[test]
+    fn notification_permission_preserves_missing_packaged_profile_error() {
+        let error = windows::core::Error::from(ERROR_NOT_FOUND.to_hresult());
+        let error = notification_permission(Err(error), true).unwrap_err();
+        assert!(error.to_string().contains("0x80070490"));
+    }
+
+    #[test]
+    fn notification_permission_preserves_other_errors() {
+        for packaged in [false, true] {
+            let error = notification_permission(Err(E_FAIL.into()), packaged).unwrap_err();
+            assert!(error.to_string().contains("0x80004005"));
+        }
+    }
+
+    #[test]
+    fn notification_permission_respects_windows_settings() {
+        for packaged in [false, true] {
+            assert_eq!(
+                notification_permission(Ok(NotificationSetting::Enabled), packaged).unwrap(),
+                PermissionState::Granted
+            );
+            for setting in [
+                NotificationSetting::DisabledForApplication,
+                NotificationSetting::DisabledForUser,
+                NotificationSetting::DisabledByGroupPolicy,
+                NotificationSetting::DisabledByManifest,
+            ] {
+                assert_eq!(
+                    notification_permission(Ok(setting), packaged).unwrap(),
+                    PermissionState::Denied
+                );
+            }
+            assert_eq!(
+                notification_permission(Ok(NotificationSetting(-1)), packaged).unwrap(),
+                PermissionState::Prompt
+            );
+        }
+    }
+
+    #[test]
+    fn test_plain_icon_path_strips_verbatim_prefix() {
+        assert_eq!(
+            plain_icon_path(std::path::Path::new(r"\\?\C:\app\icons\32x32.png")),
+            r"C:\app\icons\32x32.png"
+        );
+        assert_eq!(
+            plain_icon_path(std::path::Path::new(r"\\?\D:\a b\icons\32x32.png")),
+            r"D:\a b\icons\32x32.png"
+        );
+    }
+
+    #[test]
+    fn test_plain_icon_path_maps_verbatim_unc_prefix() {
+        assert_eq!(
+            plain_icon_path(std::path::Path::new(r"\\?\UNC\server\share\32x32.png")),
+            r"\\server\share\32x32.png"
+        );
+    }
+
+    #[test]
+    fn test_plain_icon_path_keeps_plain_path_unchanged() {
+        assert_eq!(
+            plain_icon_path(std::path::Path::new(r"C:\app\icons\32x32.png")),
+            r"C:\app\icons\32x32.png"
+        );
+    }
+
     // ==================== Time Conversion Tests ====================
 
     /// Windows FILETIME epoch (1601-01-01) offset from Unix epoch (1970-01-01),
@@ -1277,6 +1825,106 @@ mod tests {
 
         let xml = doc.GetXml().expect("Failed to get XML").to_string_lossy();
         assert!(xml.contains("actions") && xml.contains("Accept"));
+    }
+
+    // ==================== Vendored Patch Tests ====================
+
+    /// The text box, the button that submits it, and the JSON `arguments=` the
+    /// button carries — the three pieces upstream never emitted.
+    #[test]
+    fn test_toast_xml_with_input() {
+        let action: Action = serde_json::from_value(serde_json::json!({
+            "id": "reply",
+            "title": "回复",
+            "foreground": true,
+            "input": true,
+            "inputButtonTitle": "回复",
+            "inputPlaceholder": "输入回复内容",
+        }))
+        .expect("input action must deserialize from the camelCase wire shape");
+
+        assert!(action.input());
+        assert_eq!(action.input_button_title(), Some("回复"));
+        assert_eq!(action.input_placeholder(), Some("输入回复内容"));
+        assert_eq!(input_element_id(action.id()), "input-reply");
+
+        let arguments = action_arguments(
+            action.id(),
+            &HashMap::from([(
+                "sessionId".to_string(),
+                serde_json::Value::String("s-1".to_string()),
+            )]),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&arguments).expect("arguments must be JSON");
+        assert_eq!(parsed["actionId"], "reply");
+        assert_eq!(parsed["data"]["sessionId"], "s-1");
+
+        let doc = XmlDocument::new().expect("Failed to create XmlDocument");
+        let toast = doc
+            .CreateElement(&HSTRING::from("toast"))
+            .expect("Failed to create toast element");
+        doc.AppendChild(&toast).expect("Failed to append toast");
+        let actions = doc
+            .CreateElement(&HSTRING::from("actions"))
+            .expect("Failed to create actions element");
+
+        let input = doc
+            .CreateElement(&HSTRING::from("input"))
+            .expect("Failed to create input element");
+        input
+            .SetAttribute(
+                &HSTRING::from("id"),
+                &HSTRING::from(input_element_id(action.id()).as_str()),
+            )
+            .expect("Failed to set id attribute");
+        input
+            .SetAttribute(&HSTRING::from("type"), &HSTRING::from("text"))
+            .expect("Failed to set type attribute");
+        input
+            .SetAttribute(
+                &HSTRING::from("placeHolderContent"),
+                &HSTRING::from(action.input_placeholder().unwrap_or_default()),
+            )
+            .expect("Failed to set placeHolderContent attribute");
+        actions.AppendChild(&input).expect("Failed to append input");
+
+        let action_el = doc
+            .CreateElement(&HSTRING::from("action"))
+            .expect("Failed to create action element");
+        action_el
+            .SetAttribute(
+                &HSTRING::from("content"),
+                &HSTRING::from(action.input_button_title().unwrap_or(action.title())),
+            )
+            .expect("Failed to set content attribute");
+        action_el
+            .SetAttribute(
+                &HSTRING::from("arguments"),
+                &HSTRING::from(arguments.as_str()),
+            )
+            .expect("Failed to set arguments attribute");
+        action_el
+            .SetAttribute(
+                &HSTRING::from("hint-inputId"),
+                &HSTRING::from(input_element_id(action.id()).as_str()),
+            )
+            .expect("Failed to set hint-inputId attribute");
+        actions
+            .AppendChild(&action_el)
+            .expect("Failed to append action");
+        toast
+            .AppendChild(&actions)
+            .expect("Failed to append actions");
+
+        let xml = doc.GetXml().expect("Failed to get XML").to_string_lossy();
+        assert!(xml.contains("placeHolderContent"), "xml: {xml}");
+        assert!(xml.contains("hint-inputId"), "xml: {xml}");
+        assert!(xml.contains("input-reply"), "xml: {xml}");
+        // Attribute values are XML-escaped, so the JSON's own quotes arrive as
+        // `&quot;` — match on the bare key instead.
+        assert!(xml.contains("actionId"), "xml: {xml}");
+        assert!(xml.contains("sessionId"), "xml: {xml}");
     }
 
     #[test]

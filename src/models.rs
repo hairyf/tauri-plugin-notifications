@@ -455,6 +455,28 @@ impl Action {
     pub const fn foreground(&self) -> bool {
         self.foreground
     }
+
+    /// Vendored patch: whether this action collects free-form text.
+    #[must_use]
+    pub const fn input(&self) -> bool {
+        self.input
+    }
+
+    /// Vendored patch: placeholder for the text box, when `input()` is on.
+    #[must_use]
+    pub fn input_placeholder(&self) -> Option<&str> {
+        self.input_placeholder.as_deref()
+    }
+
+    /// Vendored patch: label of the button that submits the text box.
+    ///
+    /// Windows renders a single button per `<action>`, so when
+    /// [`Action::input`] is on this label replaces [`Action::title`] as the
+    /// button caption.
+    #[must_use]
+    pub fn input_button_title(&self) -> Option<&str> {
+        self.input_button_title.as_deref()
+    }
 }
 
 pub use android::*;
@@ -744,7 +766,7 @@ mod tests {
         assert!(!data.ongoing);
         assert!(!data.auto_cancel);
         assert!(!data.silent);
-        assert_eq!(data.inbox_lines, [] as [String; 0]);
+        assert!(data.inbox_lines.is_empty());
         assert!(data.attachments.is_empty());
         assert!(data.extra.is_empty());
     }
