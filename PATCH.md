@@ -94,6 +94,9 @@ twice.
     silently swallowed click.
   - `show()` — attaches the in-process handler when *either* `notificationClicked` or
     `actionPerformed` has a listener.
+  - Unpackaged initialization registers the notification AUMID before creating the notifier,
+    independently of the optional COM CLSID. Without a CLSID it writes only identity metadata;
+    explicit COM configuration retains `CustomActivator`, `LocalServer32`, and the activator thread.
   - `register_unpackaged_app_id()` — writes `HKCU\Software\Classes\AppUserModelId\<app_id>`
     (`DisplayName`, `IconUri`, `CustomActivator={CLSID}`) and
     `HKCU\Software\Classes\CLSID\{CLSID}\LocalServer32` = the current executable, which is the

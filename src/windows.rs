@@ -624,6 +624,26 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 ) -> crate::Result<Notifications<R>> {
     let app_id = app.config().identifier.clone();
     let packaged = is_packaged();
+    if !packaged {
+        let display_name = app.config().product_name.as_deref().unwrap_or(&app_id);
+        let icon_path = windows_config.icon_path.as_ref().and_then(|path| {
+            match app.path().resolve(path, BaseDirectory::Resource) {
+                Ok(resolved) if resolved.is_file() => Some(resolved),
+                result => {
+                    log::warn!("Cannot resolve notification icon {path:?}: {result:?}");
+                    None
+                }
+            }
+        });
+        if let Err(e) = register_unpackaged_app_id(
+            display_name,
+            &app_id,
+            windows_config.toast_activator_clsid.as_deref(),
+            icon_path.as_deref(),
+        ) {
+            log::error!("Failed to register notification AUMID {app_id}: {e}");
+        }
+    }
     let notifier = if packaged {
         ToastNotificationManager::CreateToastNotifier()?
     } else {
@@ -642,40 +662,7 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
         push_channel: RwLock::new(None),
     });
 
-    // Vendored patch: the COM activator used to be registered only for packaged
-    // builds, which meant unpackaged DSH never received click or button events
-    // at all. Registering it always is half the fix; the other half is
-    // `register_unpackaged_app_id` below, which gives Windows an AUMID whose
-    // `CustomActivator` points at this CLSID.
     if let Some(clsid_str) = windows_config.toast_activator_clsid.as_deref() {
-        if !packaged {
-            let display_name = app
-                .config()
-                .product_name
-                .clone()
-                .unwrap_or_else(|| plugin.app_id.clone());
-            let icon_path = windows_config.icon_path.as_ref().and_then(|path| {
-                match app.path().resolve(path, BaseDirectory::Resource) {
-                    Ok(resolved) if resolved.is_file() => Some(resolved),
-                    result => {
-                        log::warn!("Cannot resolve notification icon {path:?}: {result:?}");
-                        None
-                    }
-                }
-            });
-            if let Err(e) = register_unpackaged_app_id(
-                &display_name,
-                &plugin.app_id,
-                clsid_str,
-                icon_path.as_deref(),
-            ) {
-                log::error!(
-                    "Failed to register AUMID {} for toast activation: {e}; \
-                     Action Center clicks will fall back to shortcut launch without payload",
-                    plugin.app_id
-                );
-            }
-        }
         spawn_toast_activator(&plugin, clsid_str);
     }
 
@@ -729,31 +716,12 @@ fn plain_icon_path(path: &std::path::Path) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Vendored patch: register the AUMID an unpackaged build needs for toast
-/// activation.
-///
-/// A packaged app inherits a working AUMID from its manifest. An unpackaged one
-/// has none, and without it Windows has no idea which COM class to activate when
-/// the user clicks a toast — the click silently degrades into a plain shortcut
-/// launch that carries no payload. These keys give it that mapping:
-/// `Software\Classes\AppUserModelId\<app_id>` carries the display name and the
-/// `CustomActivator` CLSID, and `Software\Classes\CLSID\{clsid}\LocalServer32`
-/// points at this executable so Windows can relaunch it for a cold activation.
-///
-/// Mirrors what the wry/tao notification guides and the Windows SDK describe for
-/// unpackaged toast registration. Best-effort: failures are logged and the
-/// in-process `Activated` path still delivers clicks while the app is running.
 fn register_unpackaged_app_id(
     display_name: &str,
     app_id: &str,
-    clsid_str: &str,
+    clsid_str: Option<&str>,
     icon_path: Option<&std::path::Path>,
 ) -> windows::core::Result<()> {
-    let exe = std::env::current_exe().map_err(|e| {
-        windows::core::Error::new(E_FAIL, format!("cannot resolve current executable: {e}"))
-    })?;
-    let exe = exe.to_string_lossy().into_owned();
-
     // HKCU\Software\Classes\AppUserModelId\<app_id>
     let aumid_path = HSTRING::from(format!("Software\\Classes\\AppUserModelId\\{app_id}"));
     let mut aumid_key = HKEY::default();
@@ -778,15 +746,24 @@ fn register_unpackaged_app_id(
             Some(path) => write_registry_string(aumid_key, Some("IconUri"), &plain_icon_path(path)),
             None => Ok(()),
         })
-        .and_then(|()| {
-            write_registry_string(
+        .and_then(|()| match clsid_str {
+            Some(clsid) => write_registry_string(
                 aumid_key,
                 Some("CustomActivator"),
-                &format!("{{{clsid_str}}}"),
-            )
+                &format!("{{{clsid}}}"),
+            ),
+            None => Ok(()),
         });
     unsafe { let _ = RegCloseKey(aumid_key); };
     result?;
+
+    let Some(clsid_str) = clsid_str else {
+        return Ok(());
+    };
+    let exe = std::env::current_exe().map_err(|e| {
+        windows::core::Error::new(E_FAIL, format!("cannot resolve current executable: {e}"))
+    })?;
+    let exe = exe.to_string_lossy().into_owned();
 
     // HKCU\Software\Classes\CLSID\{clsid}
     let clsid_path = HSTRING::from(format!("Software\\Classes\\CLSID\\{{{clsid_str}}}"));
@@ -1556,6 +1533,88 @@ mod tests {
     /// PowerShell App User Model ID - always available on Windows.
     const POWERSHELL_APP_ID: &str =
         "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
+
+    struct RegistrationTest {
+        app_id: String,
+        clsid: String,
+        root: std::path::PathBuf,
+    }
+
+    impl RegistrationTest {
+        fn new() -> Self {
+            let app_id = format!("dsh-notifications-test-{:016x}", rand::random::<u64>());
+            let root = std::env::temp_dir().join(&app_id);
+            std::fs::create_dir(&root).unwrap();
+            let clsid = uuid::Uuid::from_u128(rand::random()).to_string();
+            Self { app_id, clsid, root }
+        }
+
+        fn value(&self, name: &str) -> windows::core::Result<String> {
+            Self::value_at(&format!("Software\\Classes\\AppUserModelId\\{}", self.app_id), name)
+        }
+
+        fn value_at(path: &str, name: &str) -> windows::core::Result<String> {
+            use windows::Win32::System::Registry::{RRF_RT_REG_SZ, RegGetValueW};
+            let path = HSTRING::from(path);
+            let mut buffer = [0_u16; 2048];
+            let mut bytes = u32::try_from(std::mem::size_of_val(&buffer)).unwrap();
+            unsafe {
+                RegGetValueW(
+                    HKEY_CURRENT_USER, &path, &HSTRING::from(name), RRF_RT_REG_SZ, None,
+                    Some(buffer.as_mut_ptr().cast()), Some(&raw mut bytes),
+                ).ok()?;
+            }
+            Ok(String::from_utf16(&buffer[..usize::try_from(bytes / 2).unwrap() - 1]).unwrap())
+        }
+    }
+
+    impl Drop for RegistrationTest {
+        fn drop(&mut self) {
+            use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+            use windows::Win32::System::Registry::RegDeleteTreeW;
+            for path in [
+                format!("Software\\Classes\\AppUserModelId\\{}", self.app_id),
+                format!("Software\\Classes\\CLSID\\{{{}}}", self.clsid),
+            ] {
+                let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(path)) };
+                assert!(status.is_ok() || status == ERROR_FILE_NOT_FOUND, "registry cleanup: {status:?}");
+            }
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn init_registers_unpackaged_identity_without_com_clsid() {
+        use tauri::utils::config::AppDirectoriesOverride;
+        use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+        assert!(!is_packaged(), "requires an unpackaged Windows test process");
+        let registration = RegistrationTest::new();
+        assert_eq!(registration.value("DisplayName").unwrap_err().code(), ERROR_FILE_NOT_FOUND.to_hresult());
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        context.config_mut().identifier.clone_from(&registration.app_id);
+        context.config_mut().product_name = Some("Notification identity regression".into());
+        context.config_mut().app.app_directories_override = Some(AppDirectoriesOverride::Root(registration.root.clone()));
+        let app = tauri::test::mock_builder().plugin(crate::init()).build(context).unwrap();
+        let state = app.state::<Notifications<tauri::test::MockRuntime>>();
+        assert_eq!(state.plugin.app_id, registration.app_id);
+        assert_eq!(registration.value("DisplayName").unwrap(), "Notification identity regression");
+        assert_eq!(registration.value("CustomActivator").unwrap_err().code(), ERROR_FILE_NOT_FOUND.to_hresult());
+        assert!(state.plugin.com_cookie.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn registration_preserves_explicit_com_activation() {
+        let registration = RegistrationTest::new();
+        register_unpackaged_app_id(
+            "Notification COM regression", &registration.app_id, Some(&registration.clsid), None,
+        ).unwrap();
+        assert_eq!(registration.value("DisplayName").unwrap(), "Notification COM regression");
+        assert_eq!(registration.value("CustomActivator").unwrap(), format!("{{{}}}", registration.clsid));
+        let server = RegistrationTest::value_at(
+            &format!("Software\\Classes\\CLSID\\{{{}}}\\LocalServer32", registration.clsid), "",
+        ).unwrap();
+        assert_eq!(server, std::env::current_exe().unwrap().to_string_lossy());
+    }
 
     #[test]
     fn notification_permission_allows_missing_unpackaged_profile() {
