@@ -21,7 +21,7 @@ use tauri::{
     plugin::{PermissionState, PluginApi},
 };
 use windows::ApplicationModel::Package;
-use windows::Data::Xml::Dom::XmlDocument;
+use windows::Data::Xml::Dom::{XmlDocument, XmlElement};
 use windows::Foundation::Collections::ValueSet;
 use windows::Foundation::{DateTime, IStringable, TypedEventHandler};
 #[cfg(feature = "push-notifications")]
@@ -474,7 +474,10 @@ impl INotificationActivationCallback_Impl for ToastActivator_Impl {
             return Ok(());
         }
 
-        log::debug!("Toast COM activation (args={invoked:?}, inputs={})", inputs.len());
+        log::debug!(
+            "Toast COM activation (args={invoked:?}, inputs={})",
+            inputs.len()
+        );
         let _ = crate::listeners::trigger("actionPerformed", decoded.action.to_string());
 
         if let Some(click_payload) = decoded.click {
@@ -626,11 +629,14 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     let packaged = is_packaged();
     if !packaged {
         let display_name = app.config().product_name.as_deref().unwrap_or(&app_id);
-        let icon_path = windows_config.icon_path.as_ref().and_then(|path| {
-            match app.path().resolve(path, BaseDirectory::Resource) {
+        let icon_path = windows_config.icon_path.and_then(|path| {
+            match app.path().resolve(&path, BaseDirectory::Resource) {
                 Ok(resolved) if resolved.is_file() => Some(resolved),
                 result => {
-                    log::warn!("Cannot resolve notification icon {path:?}: {result:?}");
+                    log::warn!(
+                        "Cannot resolve notification icon {}: {result:?}",
+                        path.display()
+                    );
                     None
                 }
             }
@@ -681,20 +687,10 @@ fn write_registry_string(key: HKEY, name: Option<&str>, value: &str) -> windows:
     let bytes = unsafe { buffer.align_to::<u8>().1 };
 
     let name = name.map(HSTRING::from);
-    // The two branches instantiate `P1` differently (`&HSTRING` vs `PCWSTR`) —
-    // both satisfy `Param<PCWSTR>`, but through different impls, so they cannot
-    // share one call expression.
-    let status = unsafe {
-        match name.as_ref() {
-            Some(name) => RegSetValueExW(key, name, None, REG_SZ, Some(bytes)),
-            None => RegSetValueExW(key, PCWSTR::null(), None, REG_SZ, Some(bytes)),
-        }
-    };
-    if status.0 != 0 {
-        Err(status.into())
-    } else {
-        Ok(())
-    }
+    let name = name
+        .as_ref()
+        .map_or(PCWSTR::null(), |name| PCWSTR(name.as_ptr()));
+    unsafe { RegSetValueExW(key, name, None, REG_SZ, Some(bytes)).ok() }
 }
 
 /// Vendored patch: strip the `\\?\` verbatim prefix so `IconUri` is a plain
@@ -708,12 +704,12 @@ fn write_registry_string(key: HKEY, name: Option<&str>, value: &str) -> windows:
 fn plain_icon_path(path: &std::path::Path) -> std::borrow::Cow<'_, str> {
     let text = path.to_string_lossy();
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        std::borrow::Cow::Owned(format!(r"\\{rest}"))
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        std::borrow::Cow::Owned(rest.to_owned())
-    } else {
-        text
+        return std::borrow::Cow::Owned(format!(r"\\{rest}"));
     }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return std::borrow::Cow::Owned(rest.to_owned());
+    }
+    text
 }
 
 fn register_unpackaged_app_id(
@@ -742,19 +738,19 @@ fn register_unpackaged_app_id(
         return Err(status.into());
     }
     let result = write_registry_string(aumid_key, Some("DisplayName"), display_name)
-        .and_then(|()| match icon_path {
-            Some(path) => write_registry_string(aumid_key, Some("IconUri"), &plain_icon_path(path)),
-            None => Ok(()),
+        .and_then(|()| {
+            icon_path.map_or(Ok(()), |path| {
+                write_registry_string(aumid_key, Some("IconUri"), &plain_icon_path(path))
+            })
         })
-        .and_then(|()| match clsid_str {
-            Some(clsid) => write_registry_string(
-                aumid_key,
-                Some("CustomActivator"),
-                &format!("{{{clsid}}}"),
-            ),
-            None => Ok(()),
+        .and_then(|()| {
+            clsid_str.map_or(Ok(()), |clsid| {
+                write_registry_string(aumid_key, Some("CustomActivator"), &format!("{{{clsid}}}"))
+            })
         });
-    unsafe { let _ = RegCloseKey(aumid_key); };
+    unsafe {
+        let _ = RegCloseKey(aumid_key);
+    };
     result?;
 
     let Some(clsid_str) = clsid_str else {
@@ -785,7 +781,9 @@ fn register_unpackaged_app_id(
         return Err(status.into());
     }
     let result = write_registry_string(clsid_key, None, display_name);
-    unsafe { let _ = RegCloseKey(clsid_key); };
+    unsafe {
+        let _ = RegCloseKey(clsid_key);
+    };
     result?;
 
     // HKCU\Software\Classes\CLSID\{clsid}\LocalServer32 = <exe>
@@ -810,7 +808,9 @@ fn register_unpackaged_app_id(
         return Err(status.into());
     }
     let result = write_registry_string(server_key, None, &exe);
-    unsafe { let _ = RegCloseKey(server_key); };
+    unsafe {
+        let _ = RegCloseKey(server_key);
+    };
     result?;
 
     log::info!("Registered unpackaged AUMID {app_id} (clsid={clsid_str}, exe={exe})");
@@ -849,8 +849,14 @@ fn spawn_toast_activator(plugin: &Arc<WindowsPlugin>, clsid_str: &str) {
                 return;
             }
             let factory_interface: IClassFactory = factory.into();
-            let cookie =
-                unsafe { CoRegisterClassObject(&raw const clsid, &factory_interface, CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE) };
+            let cookie = unsafe {
+                CoRegisterClassObject(
+                    &raw const clsid,
+                    &factory_interface,
+                    CLSCTX_LOCAL_SERVER,
+                    REGCLS_MULTIPLEUSE,
+                )
+            };
             match cookie {
                 Ok(cookie) => {
                     if let Ok(mut slot) = plugin.com_cookie.write() {
@@ -980,15 +986,33 @@ impl<R: Runtime> crate::NotificationsBuilder<R> {
         visual.AppendChild(&binding)?;
         toast.AppendChild(&visual)?;
 
-        // Add <actions> if action_type_id specified
+        self.append_toast_actions(&doc, &toast, action_types)?;
+
+        // Add <audio> element for silent or custom sound
+        if self.data.silent {
+            let audio = doc.CreateElement(&HSTRING::from("audio"))?;
+            audio.SetAttribute(&HSTRING::from("silent"), &HSTRING::from("true"))?;
+            toast.AppendChild(&audio)?;
+        } else if let Some(sound) = &self.data.sound {
+            let audio = doc.CreateElement(&HSTRING::from("audio"))?;
+            audio.SetAttribute(&HSTRING::from("src"), &HSTRING::from(sound.as_str()))?;
+            toast.AppendChild(&audio)?;
+        }
+
+        Ok(doc)
+    }
+
+    fn append_toast_actions(
+        &self,
+        doc: &XmlDocument,
+        toast: &XmlElement,
+        action_types: &HashMap<String, ActionType>,
+    ) -> crate::Result<()> {
         if let Some(action_type_id) = &self.data.action_type_id
             && let Some(action_type) = action_types.get(action_type_id)
         {
             let actions = doc.CreateElement(&HSTRING::from("actions"))?;
 
-            // Vendored patch: text boxes are declared before the buttons that
-            // submit them, since `<action hint-inputId=…>` can only reference an
-            // id that already exists in the document.
             for action in action_type.actions() {
                 if !action.input() {
                     continue;
@@ -1010,10 +1034,9 @@ impl<R: Runtime> crate::NotificationsBuilder<R> {
 
             for action in action_type.actions() {
                 let action_el = doc.CreateElement(&HSTRING::from("action"))?;
-                // Vendored patch: an input action's caption is the submit
-                // button label, which Windows takes from the same `content=`
-                // attribute as any other button.
-                let content = action.input_button_title().unwrap_or(action.title());
+                let content = action
+                    .input_button_title()
+                    .unwrap_or_else(|| action.title());
                 action_el.SetAttribute(&HSTRING::from("content"), &HSTRING::from(content))?;
                 action_el.SetAttribute(
                     &HSTRING::from("arguments"),
@@ -1039,18 +1062,7 @@ impl<R: Runtime> crate::NotificationsBuilder<R> {
             toast.AppendChild(&actions)?;
         }
 
-        // Add <audio> element for silent or custom sound
-        if self.data.silent {
-            let audio = doc.CreateElement(&HSTRING::from("audio"))?;
-            audio.SetAttribute(&HSTRING::from("silent"), &HSTRING::from("true"))?;
-            toast.AppendChild(&audio)?;
-        } else if let Some(sound) = &self.data.sound {
-            let audio = doc.CreateElement(&HSTRING::from("audio"))?;
-            audio.SetAttribute(&HSTRING::from("src"), &HSTRING::from(sound.as_str()))?;
-            toast.AppendChild(&audio)?;
-        }
-
-        Ok(doc)
+        Ok(())
     }
 
     #[allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)]
@@ -1111,89 +1123,7 @@ impl<R: Runtime> crate::NotificationsBuilder<R> {
                         if let Some(inspectable) = &*args
                             && let Ok(activated) = inspectable.cast::<ToastActivatedEventArgs>()
                         {
-                            let arguments = activated
-                                .Arguments()
-                                .map(|s| s.to_string_lossy())
-                                .unwrap_or_default();
-
-                            // Vendored patch: text typed into any `<input>` the
-                            // toast declared. Windows delivers it only through
-                            // this event args interface, so without reading it
-                            // here a reply could never reach the JS layer.
-                            let inputs =
-                                read_user_input(activated.UserInput().ok().as_ref());
-                            let input_value = inputs
-                                .values()
-                                .next()
-                                .cloned()
-                                .map_or(serde_json::Value::Null, serde_json::Value::String);
-
-                            // Vendored patch: one click reaches us twice — here
-                            // and through the out-of-proc COM activator (see
-                            // `claim_activation`). Both carry the same arguments
-                            // and inputs, so the first one through wins.
-                            if !claim_activation(&activation_signature(&arguments, &inputs)) {
-                                log::debug!(
-                                    "Toast activation already delivered; skipping in-process handler (args={arguments:?})"
-                                );
-                                return Ok(());
-                            }
-
-                            let parsed: Option<serde_json::Value> =
-                                serde_json::from_str::<serde_json::Value>(&arguments)
-                                    .ok()
-                                    .filter(serde_json::Value::is_object);
-
-                            // Foreground tap: empty `Arguments` (legacy toasts
-                            // without `launch=`) or the JSON object we wrote into
-                            // `launch=`. A JSON object carrying `actionId` came
-                            // from an `<action arguments=…>` button instead — the
-                            // `launch=` object never has that key.
-                            let button = parsed
-                                .as_ref()
-                                .and_then(|payload| payload.get("actionId"))
-                                .and_then(serde_json::Value::as_str);
-                            let is_tap = button.is_none()
-                                && (arguments.is_empty() || parsed.is_some());
-
-                            let action_id = match button {
-                                Some(action_id) => action_id.to_string(),
-                                None => "tap".to_string(),
-                            };
-
-                            // Vendored patch: surface `extra` alongside the
-                            // notification so the JS layer can recover the
-                            // session identity from a button activation too.
-                            let extra = parsed
-                                .as_ref()
-                                .and_then(|payload| payload.get("data"))
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-
-                            let payload = serde_json::json!({
-                                "actionId": action_id,
-                                "inputValue": input_value,
-                                "notification": notification,
-                                "extra": extra,
-                            });
-                            if let Err(e) =
-                                crate::listeners::trigger("actionPerformed", payload.to_string())
-                            {
-                                log::error!("Failed to trigger actionPerformed: {e}");
-                            }
-
-                            if is_tap {
-                                let click_payload = serde_json::json!({
-                                    "id": notification.id,
-                                    "data": notification.extra,
-                                });
-                                if let Err(e) = crate::listeners::trigger(
-                                    "notificationClicked",
-                                    click_payload.to_string(),
-                                ) {
-                                    log::error!("Failed to trigger notificationClicked: {e}");
-                                }
-                            }
+                            handle_toast_activation(&notification, &activated);
                         }
                         Ok(())
                     },
@@ -1216,6 +1146,66 @@ impl<R: Runtime> crate::NotificationsBuilder<R> {
         }
 
         Ok(())
+    }
+}
+
+fn handle_toast_activation(notification: &ActiveNotification, activated: &ToastActivatedEventArgs) {
+    let arguments = activated
+        .Arguments()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+
+    let inputs = read_user_input(activated.UserInput().ok().as_ref());
+    let input_value = inputs
+        .values()
+        .next()
+        .cloned()
+        .map_or(serde_json::Value::Null, serde_json::Value::String);
+
+    if !claim_activation(&activation_signature(&arguments, &inputs)) {
+        log::debug!(
+            "Toast activation already delivered; skipping in-process handler (args={arguments:?})"
+        );
+        return;
+    }
+
+    let parsed: Option<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&arguments)
+        .ok()
+        .filter(serde_json::Value::is_object);
+
+    let button = parsed
+        .as_ref()
+        .and_then(|payload| payload.get("actionId"))
+        .and_then(serde_json::Value::as_str);
+    let is_tap = button.is_none() && (arguments.is_empty() || parsed.is_some());
+
+    let action_id = button.unwrap_or("tap").to_owned();
+
+    let extra = parsed
+        .as_ref()
+        .and_then(|payload| payload.get("data"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let payload = serde_json::json!({
+        "actionId": action_id,
+        "inputValue": input_value,
+        "notification": notification,
+        "extra": extra,
+    });
+    if let Err(e) = crate::listeners::trigger("actionPerformed", payload.to_string()) {
+        log::error!("Failed to trigger actionPerformed: {e}");
+    }
+
+    if is_tap {
+        let click_payload = serde_json::json!({
+            "id": notification.id,
+            "data": notification.extra,
+        });
+        if let Err(e) = crate::listeners::trigger("notificationClicked", click_payload.to_string())
+        {
+            log::error!("Failed to trigger notificationClicked: {e}");
+        }
     }
 }
 
@@ -1544,27 +1534,46 @@ mod tests {
         fn new() -> Self {
             let app_id = format!("dsh-notifications-test-{:016x}", rand::random::<u64>());
             let root = std::env::temp_dir().join(&app_id);
-            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(&root).expect("create isolated test directory");
             let clsid = uuid::Uuid::from_u128(rand::random()).to_string();
-            Self { app_id, clsid, root }
+            Self {
+                app_id,
+                clsid,
+                root,
+            }
         }
 
         fn value(&self, name: &str) -> windows::core::Result<String> {
-            Self::value_at(&format!("Software\\Classes\\AppUserModelId\\{}", self.app_id), name)
+            Self::value_at(
+                &format!("Software\\Classes\\AppUserModelId\\{}", self.app_id),
+                name,
+            )
         }
 
         fn value_at(path: &str, name: &str) -> windows::core::Result<String> {
             use windows::Win32::System::Registry::{RRF_RT_REG_SZ, RegGetValueW};
             let path = HSTRING::from(path);
             let mut buffer = [0_u16; 2048];
-            let mut bytes = u32::try_from(std::mem::size_of_val(&buffer)).unwrap();
+            let mut bytes = u32::try_from(std::mem::size_of_val(&buffer))
+                .expect("Windows notification regression operation must succeed");
             unsafe {
                 RegGetValueW(
-                    HKEY_CURRENT_USER, &path, &HSTRING::from(name), RRF_RT_REG_SZ, None,
-                    Some(buffer.as_mut_ptr().cast()), Some(&raw mut bytes),
-                ).ok()?;
+                    HKEY_CURRENT_USER,
+                    &path,
+                    &HSTRING::from(name),
+                    RRF_RT_REG_SZ,
+                    None,
+                    Some(buffer.as_mut_ptr().cast()),
+                    Some(&raw mut bytes),
+                )
+                .ok()?;
             }
-            Ok(String::from_utf16(&buffer[..usize::try_from(bytes / 2).unwrap() - 1]).unwrap())
+            Ok(String::from_utf16(
+                &buffer[..usize::try_from(bytes / 2)
+                    .expect("Windows notification regression operation must succeed")
+                    - 1],
+            )
+            .expect("Windows notification regression operation must succeed"))
         }
     }
 
@@ -1577,9 +1586,12 @@ mod tests {
                 format!("Software\\Classes\\CLSID\\{{{}}}", self.clsid),
             ] {
                 let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(path)) };
-                assert!(status.is_ok() || status == ERROR_FILE_NOT_FOUND, "registry cleanup: {status:?}");
+                assert!(
+                    status.is_ok() || status == ERROR_FILE_NOT_FOUND,
+                    "registry cleanup: {status:?}"
+                );
             }
-            std::fs::remove_dir_all(&self.root).unwrap();
+            std::fs::remove_dir_all(&self.root).expect("remove isolated test directory");
         }
     }
 
@@ -1587,40 +1599,99 @@ mod tests {
     fn init_registers_unpackaged_identity_without_com_clsid() {
         use tauri::utils::config::AppDirectoriesOverride;
         use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
-        assert!(!is_packaged(), "requires an unpackaged Windows test process");
+        assert!(
+            !is_packaged(),
+            "requires an unpackaged Windows test process"
+        );
         let registration = RegistrationTest::new();
-        assert_eq!(registration.value("DisplayName").unwrap_err().code(), ERROR_FILE_NOT_FOUND.to_hresult());
+        assert_eq!(
+            registration
+                .value("DisplayName")
+                .expect_err("operation must fail")
+                .code(),
+            ERROR_FILE_NOT_FOUND.to_hresult()
+        );
         let mut context = tauri::test::mock_context(tauri::test::noop_assets());
-        context.config_mut().identifier.clone_from(&registration.app_id);
+        context
+            .config_mut()
+            .identifier
+            .clone_from(&registration.app_id);
         context.config_mut().product_name = Some("Notification identity regression".into());
-        context.config_mut().app.app_directories_override = Some(AppDirectoriesOverride::Root(registration.root.clone()));
-        let app = tauri::test::mock_builder().plugin(crate::init()).build(context).unwrap();
+        context.config_mut().app.app_directories_override =
+            Some(AppDirectoriesOverride::Root(registration.root.clone()));
+        let app = tauri::test::mock_builder()
+            .plugin(crate::init())
+            .build(context)
+            .expect("Windows notification regression operation must succeed");
         let state = app.state::<Notifications<tauri::test::MockRuntime>>();
         assert_eq!(state.plugin.app_id, registration.app_id);
-        assert_eq!(registration.value("DisplayName").unwrap(), "Notification identity regression");
-        assert_eq!(registration.value("CustomActivator").unwrap_err().code(), ERROR_FILE_NOT_FOUND.to_hresult());
-        assert!(state.plugin.com_cookie.read().unwrap().is_none());
+        assert_eq!(
+            registration
+                .value("DisplayName")
+                .expect("Windows notification regression operation must succeed"),
+            "Notification identity regression"
+        );
+        assert_eq!(
+            registration
+                .value("CustomActivator")
+                .expect_err("operation must fail")
+                .code(),
+            ERROR_FILE_NOT_FOUND.to_hresult()
+        );
+        assert!(
+            state
+                .plugin
+                .com_cookie
+                .read()
+                .expect("Windows notification regression operation must succeed")
+                .is_none()
+        );
     }
 
     #[test]
     fn registration_preserves_explicit_com_activation() {
         let registration = RegistrationTest::new();
         register_unpackaged_app_id(
-            "Notification COM regression", &registration.app_id, Some(&registration.clsid), None,
-        ).unwrap();
-        assert_eq!(registration.value("DisplayName").unwrap(), "Notification COM regression");
-        assert_eq!(registration.value("CustomActivator").unwrap(), format!("{{{}}}", registration.clsid));
+            "Notification COM regression",
+            &registration.app_id,
+            Some(&registration.clsid),
+            None,
+        )
+        .expect("Windows notification regression operation must succeed");
+        assert_eq!(
+            registration
+                .value("DisplayName")
+                .expect("Windows notification regression operation must succeed"),
+            "Notification COM regression"
+        );
+        assert_eq!(
+            registration
+                .value("CustomActivator")
+                .expect("Windows notification regression operation must succeed"),
+            format!("{{{}}}", registration.clsid)
+        );
         let server = RegistrationTest::value_at(
-            &format!("Software\\Classes\\CLSID\\{{{}}}\\LocalServer32", registration.clsid), "",
-        ).unwrap();
-        assert_eq!(server, std::env::current_exe().unwrap().to_string_lossy());
+            &format!(
+                "Software\\Classes\\CLSID\\{{{}}}\\LocalServer32",
+                registration.clsid
+            ),
+            "",
+        )
+        .expect("Windows notification regression operation must succeed");
+        assert_eq!(
+            server,
+            std::env::current_exe()
+                .expect("Windows notification regression operation must succeed")
+                .to_string_lossy()
+        );
     }
 
     #[test]
     fn notification_permission_allows_missing_unpackaged_profile() {
         let error = windows::core::Error::from(ERROR_NOT_FOUND.to_hresult());
         assert_eq!(
-            notification_permission(Err(error), false).unwrap(),
+            notification_permission(Err(error), false)
+                .expect("Windows notification regression operation must succeed"),
             PermissionState::Granted
         );
     }
@@ -1628,14 +1699,15 @@ mod tests {
     #[test]
     fn notification_permission_preserves_missing_packaged_profile_error() {
         let error = windows::core::Error::from(ERROR_NOT_FOUND.to_hresult());
-        let error = notification_permission(Err(error), true).unwrap_err();
+        let error = notification_permission(Err(error), true).expect_err("operation must fail");
         assert!(error.to_string().contains("0x80070490"));
     }
 
     #[test]
     fn notification_permission_preserves_other_errors() {
         for packaged in [false, true] {
-            let error = notification_permission(Err(E_FAIL.into()), packaged).unwrap_err();
+            let error = notification_permission(Err(E_FAIL.into()), packaged)
+                .expect_err("operation must fail");
             assert!(error.to_string().contains("0x80004005"));
         }
     }
@@ -1644,7 +1716,8 @@ mod tests {
     fn notification_permission_respects_windows_settings() {
         for packaged in [false, true] {
             assert_eq!(
-                notification_permission(Ok(NotificationSetting::Enabled), packaged).unwrap(),
+                notification_permission(Ok(NotificationSetting::Enabled), packaged)
+                    .expect("Windows notification regression operation must succeed"),
                 PermissionState::Granted
             );
             for setting in [
@@ -1654,12 +1727,14 @@ mod tests {
                 NotificationSetting::DisabledByManifest,
             ] {
                 assert_eq!(
-                    notification_permission(Ok(setting), packaged).unwrap(),
+                    notification_permission(Ok(setting), packaged)
+                        .expect("Windows notification regression operation must succeed"),
                     PermissionState::Denied
                 );
             }
             assert_eq!(
-                notification_permission(Ok(NotificationSetting(-1)), packaged).unwrap(),
+                notification_permission(Ok(NotificationSetting(-1)), packaged)
+                    .expect("Windows notification regression operation must succeed"),
                 PermissionState::Prompt
             );
         }
@@ -1954,7 +2029,11 @@ mod tests {
         action_el
             .SetAttribute(
                 &HSTRING::from("content"),
-                &HSTRING::from(action.input_button_title().unwrap_or(action.title())),
+                &HSTRING::from(
+                    action
+                        .input_button_title()
+                        .unwrap_or_else(|| action.title()),
+                ),
             )
             .expect("Failed to set content attribute");
         action_el

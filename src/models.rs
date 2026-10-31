@@ -766,7 +766,7 @@ mod tests {
         assert!(!data.ongoing);
         assert!(!data.auto_cancel);
         assert!(!data.silent);
-        assert!(data.inbox_lines.is_empty());
+        assert_eq!(data.inbox_lines, Vec::<String>::new());
         assert!(data.attachments.is_empty());
         assert!(data.extra.is_empty());
     }
