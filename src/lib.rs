@@ -56,6 +56,7 @@ mod unifiedpush;
 mod windows;
 
 mod commands;
+mod dedup;
 mod error;
 #[cfg(desktop)]
 mod listeners;
