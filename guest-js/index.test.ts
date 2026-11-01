@@ -508,6 +508,15 @@ describe("Notification Functions", () => {
   });
 
   describe("sendNotification", () => {
+    it.each([true, false])("preserves the void API when notify returns %s", async (accepted) => {
+      mockInvoke.mockResolvedValue(accepted);
+
+      expect(await sendNotification("Test Title")).toBeUndefined();
+      expect(mockInvoke).toHaveBeenCalledWith("plugin:notifications|notify", {
+        options: { title: "Test Title" },
+      });
+    });
+
     it("should send notification with string title", async () => {
       mockInvoke.mockResolvedValue(undefined);
 

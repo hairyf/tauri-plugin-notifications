@@ -3,7 +3,7 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use serde::Deserialize;
-use tauri::{AppHandle, Runtime, State, command, plugin::PermissionState};
+use tauri::{command, plugin::PermissionState, AppHandle, Runtime, State};
 
 use crate::{NotificationData, Notifications, Result};
 
@@ -93,10 +93,27 @@ pub async fn notify<R: Runtime>(
     _app: AppHandle<R>,
     notification: State<'_, Notifications<R>>,
     options: NotificationData,
-) -> Result<()> {
+) -> Result<bool> {
+    let key = options
+        .extra
+        .get("deliveryKey")
+        .and_then(serde_json::Value::as_str)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned);
+    if key.as_deref().is_some_and(|key| !crate::dedup::claim(key)) {
+        return Ok(false);
+    }
     let mut builder = notification.builder();
     builder.data = options;
-    builder.show().await
+    match builder.show().await {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            if let Some(key) = key {
+                crate::dedup::release(&key);
+            }
+            Err(error)
+        }
+    }
 }
 
 #[command]
