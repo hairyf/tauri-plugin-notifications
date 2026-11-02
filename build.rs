@@ -90,6 +90,7 @@ fn main() {
 
             swift_bridge_build::parse_bridges(bridges)
                 .write_all_concatenated(swift_bridge_out_dir(), env!("CARGO_PKG_NAME"));
+            expose_bridge_symbols();
 
             let swift_library_dir = compile_swift();
             swift_rs::SwiftLinker::new(&macos_deployment_target()).link();
@@ -103,6 +104,25 @@ fn main() {
             );
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+// Swift 6.2 whole-module optimization internalizes the @_cdecl bridge functions, so the
+// static library exports no definitions. Only the package file carries them.
+fn expose_bridge_symbols() {
+    let source = swift_bridge_out_dir()
+        .join(env!("CARGO_PKG_NAME"))
+        .join(format!("{}.swift", env!("CARGO_PKG_NAME")));
+    let contents = std::fs::read_to_string(&source).expect("Failed to read the generated Swift bridge source");
+    let patched = contents
+        .lines()
+        .map(|line| match line.starts_with("func __swift_bridge__") {
+            true => format!("public {line}"),
+            false => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&source, format!("{patched}\n")).expect("Failed to expose Swift bridge symbols");
 }
 
 #[cfg(target_os = "macos")]
