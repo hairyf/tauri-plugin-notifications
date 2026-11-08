@@ -113,12 +113,16 @@ fn expose_bridge_symbols() {
     let source = swift_bridge_out_dir()
         .join(env!("CARGO_PKG_NAME"))
         .join(format!("{}.swift", env!("CARGO_PKG_NAME")));
-    let contents = std::fs::read_to_string(&source).expect("Failed to read the generated Swift bridge source");
+    let contents =
+        std::fs::read_to_string(&source).expect("Failed to read the generated Swift bridge source");
     let patched = contents
         .lines()
-        .map(|line| match line.starts_with("func __swift_bridge__") {
-            true => format!("public {line}"),
-            false => line.to_string(),
+        .map(|line| {
+            if line.starts_with("func __swift_bridge__") {
+                format!("public {line}")
+            } else {
+                line.to_string()
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
