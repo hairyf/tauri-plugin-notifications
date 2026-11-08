@@ -117,9 +117,12 @@ fn expose_bridge_symbols() {
         std::fs::read_to_string(&source).expect("Failed to read the generated Swift bridge source");
     let patched = contents
         .lines()
-        .map(|line| match line.starts_with("func __swift_bridge__") {
-            true => format!("public {line}"),
-            false => line.to_string(),
+        .map(|line| {
+            if line.starts_with("func __swift_bridge__") {
+                format!("public {line}")
+            } else {
+                line.to_string()
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
