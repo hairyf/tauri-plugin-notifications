@@ -9,10 +9,10 @@ fn deliveries() -> &'static Mutex<VecDeque<String>> {
     DELIVERIES.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-pub(crate) fn claim(key: &str) -> bool {
+pub fn claim(key: &str) -> bool {
     let mut entries = deliveries()
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if entries.iter().any(|entry| entry == key) {
         return false;
     }
@@ -24,10 +24,10 @@ pub(crate) fn claim(key: &str) -> bool {
     true
 }
 
-pub(crate) fn release(key: &str) {
+pub fn release(key: &str) {
     deliveries()
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|entry| entry != key);
 }
 
@@ -39,7 +39,11 @@ mod tests {
     fn guests_share_claims_and_failed_deliveries_can_retry() {
         let key = "session-a:turn:42";
         assert!(claim(key));
-        assert!(!std::thread::spawn(move || claim(key)).join().unwrap());
+        assert!(
+            !std::thread::spawn(move || claim(key))
+                .join()
+                .expect("claim thread panicked")
+        );
         assert!(claim("session-a:turn:43"));
         release(key);
         assert!(claim(key));
