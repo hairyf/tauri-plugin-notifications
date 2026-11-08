@@ -48,7 +48,7 @@ use windows::Win32::UI::Notifications::{
     NOTIFICATION_USER_INPUT_DATA,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, TranslateMessage,
+    ASFW_ANY, AllowSetForegroundWindow, DispatchMessageW, GetMessageW, MSG, TranslateMessage,
 };
 use windows::core::{BOOL, GUID, HSTRING, Interface, PCWSTR, Ref, implement};
 
@@ -406,6 +406,18 @@ fn claim_activation(signature: &str) -> bool {
     true
 }
 
+/// Vendored patch: hand the foreground right to the process that will raise the
+/// window. Windows only lets the foreground process (or one it authorized here)
+/// change the foreground window, and the window belongs to the Electron child.
+/// A failed grant loses the focus but never the click, so it is only logged.
+fn release_foreground_lock() {
+    unsafe {
+        if let Err(error) = AllowSetForegroundWindow(ASFW_ANY) {
+            log::debug!("AllowSetForegroundWindow failed: {error}");
+        }
+    }
+}
+
 /// Vendored patch: collect the toast text-box contents.
 ///
 /// Windows hands them over as a `ValueSet` keyed by the `<input id=…>` the
@@ -481,6 +493,7 @@ impl INotificationActivationCallback_Impl for ToastActivator_Impl {
         let _ = crate::listeners::trigger("actionPerformed", decoded.action.to_string());
 
         if let Some(click_payload) = decoded.click {
+            release_foreground_lock();
             // Deliver live OR buffer — never both. Buffering when a listener is
             // already subscribed causes duplicate events on the next re-subscribe
             // (hot reload, route change).
@@ -1198,6 +1211,7 @@ fn handle_toast_activation(notification: &ActiveNotification, activated: &ToastA
     }
 
     if is_tap {
+        release_foreground_lock();
         let click_payload = serde_json::json!({
             "id": notification.id,
             "data": notification.extra,
